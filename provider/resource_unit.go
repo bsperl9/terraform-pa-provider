@@ -35,15 +35,11 @@ func resourceUnit() *schema.Resource {
 }
 
 func getConnection(d *schema.ResourceData, m interface{}) (*sql.DB, error) {
-	config := m.(*schema.ResourceData)
-
-	connString := fmt.Sprintf("server=%s;user id=%s;password=%s;port=%s;database=SOADB",
-		config.Get("server").(string),
-		config.Get("username").(string),
-		config.Get("password").(string),
-		config.Get("port").(string))
-
-	return sql.Open("sqlserver", connString)
+	db, ok := m.(*sql.DB)
+	if !ok {
+		return nil, fmt.Errorf("failed to get database connection from provider metadata")
+	}
+	return db, nil
 }
 
 func resourceUnitCreate(ctx context.Context, d *schema.ResourceData, m interface{}) diag.Diagnostics {
@@ -57,7 +53,7 @@ func resourceUnitCreate(ctx context.Context, d *schema.ResourceData, m interface
 	description := d.Get("description").(string)
 
 	_, err = db.ExecContext(ctx,
-		"INSERT INTO SOADB.dbo.Units (PU_Id, Description) VALUES (@p1, @p2)",
+		"INSERT INTO SOADB.dbo.Local_Units (PU_Id, Description) VALUES (@p1, @p2)",
 		puID, description)
 	if err != nil {
 		return diag.FromErr(err)
@@ -78,7 +74,7 @@ func resourceUnitRead(ctx context.Context, d *schema.ResourceData, m interface{}
 	puID, _ := strconv.Atoi(d.Id())
 
 	row := db.QueryRowContext(ctx,
-		"SELECT PU_Id, Description FROM SOADB.dbo.Units WHERE PU_Id = @p1",
+		"SELECT PU_Id, Description FROM SOADB.dbo.Local_Units WHERE PU_Id = @p1",
 		puID)
 
 	var description string
@@ -108,7 +104,7 @@ func resourceUnitUpdate(ctx context.Context, d *schema.ResourceData, m interface
 	description := d.Get("description").(string)
 
 	_, err = db.ExecContext(ctx,
-		"UPDATE SOADB.dbo.Units SET Description = @p1 WHERE PU_Id = @p2",
+		"UPDATE SOADB.dbo.Local_Units SET Description = @p1 WHERE PU_Id = @p2",
 		description, puID)
 	if err != nil {
 		return diag.FromErr(err)
@@ -127,7 +123,7 @@ func resourceUnitDelete(ctx context.Context, d *schema.ResourceData, m interface
 	puID, _ := strconv.Atoi(d.Id())
 
 	_, err = db.ExecContext(ctx,
-		"DELETE FROM SOADB.dbo.Units WHERE PU_Id = @p1",
+		"DELETE FROM SOADB.dbo.Local_Units WHERE PU_Id = @p1",
 		puID)
 	if err != nil {
 		return diag.FromErr(err)
