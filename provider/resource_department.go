@@ -4,70 +4,61 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"strconv"
-	"regexp"
-	"sync"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
-	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
 	_ "github.com/microsoft/go-mssqldb"
 )
 
+type Department struct {
+	Dept_Id       	int64
+	Description  	string
+	ExtendedInfo 	string
+	TimeZone 		string
+	Tag				string
+}
+
 var (
-	cachedDepartments map[int]map[string]string
-	loadOnce          sync.Once
+	cachedDepartments map[int64]*Department
 )
+
 
 const (
 	queryLoadDepartments = `
-		SELECT Dept_Id, Dept_Desc, Extended_Info, Time_Zone 
+		SELECT Dept_Id, Dept_Desc, Extended_Info, Time_Zone, Tag 
 		FROM dbo.Departments 
 		WHERE Dept_Id >= 0 
 		ORDER BY Dept_Id DESC;`
 
 	queryCreateDepartment = `
 		EXEC @return_value = [dbo].[spEM_CreateDepartment]
-		    @Description = @desc,
-		    @User_Id = @userId,
-		    @Dept_Id = @deptId OUTPUT;
+		    @Description = @param_desc,
+		    @User_Id = @param_user_id,
+		    @Dept_Id = @out_deptId OUTPUT;
 
-		IF @return_value != 0 OR @deptId IS NULL
+		IF @return_value != 0 OR @out_deptId IS NULL
 		BEGIN
 		    RETURN;
 		END
 
 		UPDATE dbo.Departments_Base
-		SET Dept_Desc = ISNULL(@desc, Dept_Desc),
-		    Extended_Info = ISNULL(@extInfo, Extended_Info),
-		    Time_Zone = ISNULL(@tz, Time_Zone)
-		WHERE Dept_Id = @deptId;
-
-		SELECT @deptId AS id;
+		SET Dept_Desc = ISNULL(@param_desc, Dept_Desc),
+		    Extended_Info = ISNULL(@param_ext_info, Extended_Info),
+		    Time_Zone = ISNULL(@param_tz, Time_Zone),
+		    Tag = ISNULL(@param_tag, Tag)
+		WHERE Dept_Id = @out_deptId;
 		`
 
 	queryUpdateDepartment = `
 		UPDATE dbo.Departments_Base SET
-			Dept_Desc = ISNULL(@desc, Dept_Desc),
-			Extended_Info = ISNULL(@extInfo, Extended_Info),
-			Time_Zone = ISNULL(@tz, Time_Zone)
-		WHERE Dept_Id = @deptId`
+			Dept_Desc = ISNULL(@param_desc, Dept_Desc),
+			Extended_Info = ISNULL(@param_ext_info, Extended_Info),
+			Time_Zone = ISNULL(@param_tz, Time_Zone),
+			Tag = ISNULL(@param_tag, Tag)
+		WHERE Dept_Id = @param_deptId`
 
-	queryDeleteDepartment = "DELETE FROM SOADB.dbo.Departments_Base WHERE Dept_Id = @p1"
+	queryDeleteDepartment = "DELETE FROM SOADB.dbo.Departments_Base WHERE Dept_Id = @param_deptId"
 )
-
-func validateDescription() schema.SchemaValidateFunc {
-	return validation.StringMatch(
-		regexp.MustCompile(`^[\w\-\(\)]+( [\w\-\(\)]+)*$`),
-		"description can only contain alphanumeric characters, spaces, dashes (-), underscores (_), and parentheses () and must not start or end with spaces",
-	)
-}
-
-func validateTimeZone() schema.SchemaValidateFunc {
-	return validation.StringInSlice([]string{
-		"Eastern Standard Time", "Pacific Standard Time", "UTC",
-	}, false)
-}
 
 func resourceDepartment() *schema.Resource {
 	return &schema.Resource{
@@ -79,14 +70,14 @@ func resourceDepartment() *schema.Resource {
 			StateContext: schema.ImportStatePassthroughContext,
 		},
 		Schema: map[string]*schema.Schema{
-            "pu_id": {
+            "dept_id": {
                 Type:     schema.TypeInt,
                 Computed: true, // Not settable by user
             },
             "description": {
                 Type:     schema.TypeString,
                 Required: true,
-                ValidateFunc: validateDescription(),
+                ValidateFunc: validateTitle(),
             },
             "extended_info": {
                 Type:     schema.TypeString,
@@ -97,18 +88,19 @@ func resourceDepartment() *schema.Resource {
                 Optional: true,
                 ValidateFunc: validateTimeZone(),
             },
+            "tag": {
+                Type:     schema.TypeString,
+                Optional: true,
+            },
         },
 	}
 }
 
-func getDB(m interface{}) *sql.DB {
-	return m.(*sql.DB)
-}
-
-func loadDepartmentsCache(ctx context.Context, db *sql.DB) error {
+func loadDepartmentsCache(ctx context.Context, m interface{}) error {
 	var err error
+	db := getDB(m)
 	loadOnce.Do(func() {
-		cachedDepartments = make(map[int]map[string]string)
+		cachedDepartments = make(map[int64]*Department)
 
 		rows, queryErr := db.QueryContext(ctx, queryLoadDepartments)
 		if queryErr != nil {
@@ -118,17 +110,18 @@ func loadDepartmentsCache(ctx context.Context, db *sql.DB) error {
 		defer rows.Close()
 
 		for rows.Next() {
-			var id int
-			var desc, info, tz sql.NullString
-			if scanErr := rows.Scan(&id, &desc, &info, &tz); scanErr != nil {
+			var dept Department
+			var description, extendedInfo, timeZone, tag sql.NullString
+
+			if scanErr := rows.Scan(&dept.Dept_Id, &description, &extendedInfo, &timeZone, &tag); scanErr != nil {
 				err = scanErr
 				return
 			}
-			cachedDepartments[id] = map[string]string{
-				"description":   desc.String,
-				"extended_info": info.String,
-				"time_zone":     tz.String,
-			}
+			dept.Description = nullableStringToString(description)
+			dept.ExtendedInfo = nullableStringToString(extendedInfo)
+			dept.TimeZone = nullableStringToString(timeZone)
+			dept.Tag = nullableStringToString(tag)
+			cachedDepartments[dept.Dept_Id] = &dept
 		}
 	})
 	return err
@@ -136,21 +129,32 @@ func loadDepartmentsCache(ctx context.Context, db *sql.DB) error {
 
 func resourceDepartmentCreate(ctx context.Context, d *schema.ResourceData, m interface{}) diag.Diagnostics {
 	db := getDB(m)
-	description := d.Get("description").(string)
-	extendedInfo := d.Get("extended_info").(string)
-	timeZone := d.Get("time_zone").(string)
-	userId := 1
 
-	var deptID int
-	var returnValue int
+	if err := loadDepartmentsCache(ctx, m); err != nil {
+		return diag.FromErr(err)
+	}
+
+	var description sql.NullString
+	var extendedInfo sql.NullString
+	var timeZone sql.NullString
+	var tag sql.NullString
+	var deptID int64
+	var returnValue int64
+
+	description = stringToNullString(d.Get("description").(string))
+	extendedInfo = stringToNullString(d.Get("extended_info").(string))
+	timeZone = stringToNullString(d.Get("time_zone").(string))
+	tag = stringToNullString(d.Get("tag").(string))
+	userId := 1	
 
 	_, err := db.ExecContext(ctx, queryCreateDepartment,
 		sql.Named("return_value", sql.Out{Dest: &returnValue}),
-		sql.Named("desc", description),
-		sql.Named("userId", userId),
-		sql.Named("deptId", sql.Out{Dest: &deptID}),
-		sql.Named("extInfo", extendedInfo),
-		sql.Named("tz", timeZone),
+		sql.Named("param_desc", description),
+		sql.Named("param_user_id", userId),
+		sql.Named("out_deptId", sql.Out{Dest: &deptID}),
+		sql.Named("param_ext_info", extendedInfo),
+		sql.Named("param_tz", timeZone),
+		sql.Named("param_tag", tag),
 	)
 	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to execute create logic: %w", err))
@@ -159,17 +163,24 @@ func resourceDepartmentCreate(ctx context.Context, d *schema.ResourceData, m int
 		return diag.FromErr(fmt.Errorf("stored procedure returned failure status: %d or null ID", returnValue))
 	}
 
-	d.SetId(strconv.Itoa(deptID))
+	cachedDepartments[deptID] = &Department{
+		Dept_Id:      deptID,
+		Description:  nullableStringToString(description),
+		ExtendedInfo: nullableStringToString(extendedInfo),
+		TimeZone:     nullableStringToString(timeZone),
+		Tag:          nullableStringToString(tag),
+	}
+
+	d.Set("dept_id", int(deptID))
+	d.SetId(int64ToString(deptID))
 	return resourceDepartmentRead(ctx, d, m)
 }
 
 func resourceDepartmentRead(ctx context.Context, d *schema.ResourceData, m interface{}) diag.Diagnostics {
-	db := getDB(m)
-	id, _ := strconv.Atoi(d.Id())
-
-	if err := loadDepartmentsCache(ctx, db); err != nil {
+	if err := loadDepartmentsCache(ctx, m); err != nil {
 		return diag.FromErr(err)
 	}
+	id := int64(d.Get("dept_id").(int))
 
 	dept, ok := cachedDepartments[id]
 	if !ok {
@@ -177,27 +188,31 @@ func resourceDepartmentRead(ctx context.Context, d *schema.ResourceData, m inter
 		return nil
 	}
 
-	d.Set("id", id)
-	d.Set("description", dept["description"])
-	d.Set("extended_info", dept["extended_info"])
-	d.Set("time_zone", dept["time_zone"])
+	d.Set("dept_id", id)
+	d.Set("description", dept.Description)
+	d.Set("extended_info", dept.ExtendedInfo)
+	d.Set("time_zone", dept.TimeZone)
+	d.Set("tag", dept.Tag)
 	return nil
 }
 
 func resourceDepartmentUpdate(ctx context.Context, d *schema.ResourceData, m interface{}) diag.Diagnostics {
 	db := getDB(m)
-	id, _ := strconv.Atoi(d.Id())
+
+	id := int64(d.Get("dept_id").(int))
 	description := d.Get("description").(string)
 	extendedInfo := d.Get("extended_info").(string)
 	timeZone := d.Get("time_zone").(string)
+	tag := d.Get("tag").(string)
 	userId := 1
 
 	_, err := db.ExecContext(ctx, queryUpdateDepartment,
-		sql.Named("deptId", id),
-		sql.Named("desc", description),
-		sql.Named("userId", userId),
-		sql.Named("extInfo", extendedInfo),
-		sql.Named("tz", timeZone),
+		sql.Named("param_deptId", id),
+		sql.Named("param_desc", stringToNullString(description)),
+		sql.Named("param_user_id", userId),
+		sql.Named("param_ext_info", stringToNullString(extendedInfo)),
+		sql.Named("param_tz", stringToNullString(timeZone)),
+		sql.Named("param_tag", stringToNullString(tag)),
 	)
 	if err != nil {
 		return diag.FromErr(err)
@@ -208,13 +223,15 @@ func resourceDepartmentUpdate(ctx context.Context, d *schema.ResourceData, m int
 
 func resourceDepartmentDelete(ctx context.Context, d *schema.ResourceData, m interface{}) diag.Diagnostics {
 	db := getDB(m)
-	id, _ := strconv.Atoi(d.Id())
 
-	_, err := db.ExecContext(ctx, queryDeleteDepartment, id)
+	id := int64(d.Get("dept_id").(int))
+
+	_, err := db.ExecContext(ctx, queryDeleteDepartment, sql.Named("param_deptId", id))
 	if err != nil {
 		return diag.FromErr(err)
 	}
 
+	delete(cachedDepartments, id)
 	d.SetId("")
 	return nil
 }
